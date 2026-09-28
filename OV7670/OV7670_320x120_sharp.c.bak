@@ -1,0 +1,608 @@
+#include "OV7670.h"
+#include "delay.h"
+#include <stddef.h>
+#include <string.h>
+
+/* OV7670 control signals. Change these definitions with the PCB wiring. */
+#define OV7670_RESET_PORT       GPIOC
+#define OV7670_RESET_PIN        GPIO_PIN_4
+#define OV7670_PWDN_PORT        GPIOC
+#define OV7670_PWDN_PIN         GPIO_PIN_5
+
+#define OV7670_SIOC_PORT        GPIOB
+#define OV7670_SIOC_PIN         GPIO_PIN_10
+#define OV7670_SIOD_PORT        GPIOB
+#define OV7670_SIOD_PIN         GPIO_PIN_11
+
+#define OV7670_SCCB_DELAY_US    3U
+#define OV7670_CONFIG_DELAY_US  100U
+#define OV7670_ID_PID           0x76U
+#define OV7670_ID_VER           0x73U
+
+typedef struct
+{
+    uint8_t reg;
+    uint8_t value;
+} OV7670_RegValueTypeDef;
+
+DCMI_HandleTypeDef hdcmi;
+DMA_HandleTypeDef hdma_dcmi;
+
+/* Four-byte alignment is guaranteed by the uint32_t element type. DCMI DMA
+ * writes one 32-bit word for every four bytes received from the sensor. */
+static uint32_t s_frame_buffer[OV7670_FRAME_WORDS];
+static volatile uint8_t s_frame_ready = 0U;
+static volatile uint32_t s_last_error = HAL_DCMI_ERROR_NONE;
+static uint8_t s_initialized = 0U;
+static uint8_t s_dcmi_msp_initialized = 0U;
+
+/* This is the register sequence supplied with the camera module. It selects
+ * RGB565 and the QVGA timing base; QQVGA downsampling is applied afterwards. */
+static const OV7670_RegValueTypeDef s_vendor_qvga_config[] =
+{
+    {0x3A, 0x04}, {0x40, 0xD0}, {0x12, 0x14}, {0x32, 0x80},
+    {0x17, 0x16}, {0x18, 0x04}, {0x19, 0x02}, {0x1A, 0x7B},
+    {0x03, 0x06}, {0x0C, 0x04}, {0x3E, 0x00}, {0x70, 0x3A},
+    {0x71, 0x35}, {0x72, 0x11}, {0x73, 0x00}, {0xA2, 0x02},
+    {0x11, 0x81},
+
+    {0x7A, 0x20}, {0x7B, 0x1C}, {0x7C, 0x28}, {0x7D, 0x3C},
+    {0x7E, 0x55}, {0x7F, 0x68}, {0x80, 0x76}, {0x81, 0x80},
+    {0x82, 0x88}, {0x83, 0x8F}, {0x84, 0x96}, {0x85, 0xA3},
+    {0x86, 0xAF}, {0x87, 0xC4}, {0x88, 0xD7}, {0x89, 0xE8},
+
+    {0x13, 0xE0}, {0x00, 0x00}, {0x10, 0x00}, {0x0D, 0x00},
+    {0x14, 0x28}, {0xA5, 0x05}, {0xAB, 0x07}, {0x24, 0x75},
+    {0x25, 0x63}, {0x26, 0xA5}, {0x9F, 0x78}, {0xA0, 0x68},
+    {0xA1, 0x03}, {0xA6, 0xDF}, {0xA7, 0xDF}, {0xA8, 0xF0},
+    {0xA9, 0x90}, {0xAA, 0x94}, {0x13, 0xE5},
+
+    {0x0E, 0x61}, {0x0F, 0x4B}, {0x16, 0x02}, {0x1E, 0x07},
+    {0x21, 0x02}, {0x22, 0x91}, {0x29, 0x07}, {0x33, 0x0B},
+    {0x35, 0x0B}, {0x37, 0x1D}, {0x38, 0x71}, {0x39, 0x2A},
+    {0x3C, 0x78}, {0x4D, 0x40}, {0x4E, 0x20}, {0x69, 0x00},
+    {0x6B, 0x60}, {0x74, 0x19}, {0x8D, 0x4F}, {0x8E, 0x00},
+    {0x8F, 0x00}, {0x90, 0x00}, {0x91, 0x00}, {0x92, 0x00},
+    {0x96, 0x00}, {0x9A, 0x80}, {0xB0, 0x84}, {0xB1, 0x0C},
+    {0xB2, 0x0E}, {0xB3, 0x82}, {0xB8, 0x0A},
+
+    {0x43, 0x14}, {0x44, 0xF0}, {0x45, 0x34}, {0x46, 0x58},
+    {0x47, 0x28}, {0x48, 0x3A}, {0x59, 0x88}, {0x5A, 0x88},
+    {0x5B, 0x44}, {0x5C, 0x67}, {0x5D, 0x49}, {0x5E, 0x0E},
+    {0x64, 0x04}, {0x65, 0x20}, {0x66, 0x05}, {0x94, 0x04},
+    {0x95, 0x08}, {0x6C, 0x0A}, {0x6D, 0x55}, {0x6E, 0x11},
+    {0x6F, 0x9F}, {0x6A, 0x40}, {0x01, 0x40}, {0x02, 0x40},
+    {0x13, 0xE7}, {0x15, 0x00},
+
+    {0x4F, 0x80}, {0x50, 0x80}, {0x51, 0x00}, {0x52, 0x22},
+    {0x53, 0x5E}, {0x54, 0x80}, {0x58, 0x9E}, {0x41, 0x08},
+    {0x3F, 0x00}, {0x75, 0x05}, {0x76, 0xE1}, {0x4C, 0x00},
+    {0x77, 0x01}, {0x3D, 0xC2}, {0x4B, 0x09}, {0xC9, 0x60},
+    {0x41, 0x38}, {0x56, 0x40}, {0x34, 0x11}, {0x3B, 0x02},
+    {0xA4, 0x89}, {0x96, 0x00}, {0x97, 0x30}, {0x98, 0x20},
+    {0x99, 0x30}, {0x9A, 0x84}, {0x9B, 0x29}, {0x9C, 0x03},
+    {0x9D, 0x4C}, {0x9E, 0x3F}, {0x78, 0x04},
+
+    {0x79, 0x01}, {0xC8, 0xF0}, {0x79, 0x0F}, {0xC8, 0x00},
+    {0x79, 0x10}, {0xC8, 0x7E}, {0x79, 0x0A}, {0xC8, 0x80},
+    {0x79, 0x0B}, {0xC8, 0x01}, {0x79, 0x0C}, {0xC8, 0x0F},
+    {0x79, 0x0D}, {0xC8, 0x20}, {0x79, 0x09}, {0xC8, 0x80},
+    {0x79, 0x02}, {0xC8, 0xC0}, {0x79, 0x03}, {0xC8, 0x40},
+    {0x79, 0x05}, {0xC8, 0x30}, {0x79, 0x26}, {0x09, 0x00}
+};
+
+/* COM14/DCW settings reduce the QVGA timing base to 160x120. */
+static const OV7670_RegValueTypeDef s_qqvga_overrides[] =
+{
+    {0x0C, 0x04}, /* COM3: enable down-sized output */
+    {0x3E, 0x1A}, /* COM14: enable DCW and divide PCLK */
+    {0x72, 0x22}, /* DCWCTR: horizontal/vertical divide by four */
+    {0x73, 0xF2}  /* PCLK divider for the down-sized stream */
+};
+
+static void SCCB_Delay(void)
+{
+    delay_us(OV7670_SCCB_DELAY_US);
+}
+
+static void SCCB_SCL_H(void)
+{
+    HAL_GPIO_WritePin(OV7670_SIOC_PORT, OV7670_SIOC_PIN, GPIO_PIN_SET);
+}
+
+static void SCCB_SCL_L(void)
+{
+    HAL_GPIO_WritePin(OV7670_SIOC_PORT, OV7670_SIOC_PIN, GPIO_PIN_RESET);
+}
+
+static void SCCB_SDA_H(void)
+{
+    HAL_GPIO_WritePin(OV7670_SIOD_PORT, OV7670_SIOD_PIN, GPIO_PIN_SET);
+}
+
+static void SCCB_SDA_L(void)
+{
+    HAL_GPIO_WritePin(OV7670_SIOD_PORT, OV7670_SIOD_PIN, GPIO_PIN_RESET);
+}
+
+static GPIO_PinState SCCB_SDA_Read(void)
+{
+    return HAL_GPIO_ReadPin(OV7670_SIOD_PORT, OV7670_SIOD_PIN);
+}
+
+static void SCCB_Start(void)
+{
+    SCCB_SDA_H();
+    SCCB_SCL_H();
+    SCCB_Delay();
+    SCCB_SDA_L();
+    SCCB_Delay();
+    SCCB_SCL_L();
+    SCCB_Delay();
+}
+
+static void SCCB_Stop(void)
+{
+    SCCB_SDA_L();
+    SCCB_Delay();
+    SCCB_SCL_H();
+    SCCB_Delay();
+    SCCB_SDA_H();
+    SCCB_Delay();
+}
+
+static uint8_t SCCB_WriteByte(uint8_t value)
+{
+    uint8_t mask;
+    uint8_t ack;
+
+    for (mask = 0x80U; mask != 0U; mask >>= 1U)
+    {
+        if ((value & mask) != 0U)
+        {
+            SCCB_SDA_H();
+        }
+        else
+        {
+            SCCB_SDA_L();
+        }
+        SCCB_Delay();
+        SCCB_SCL_H();
+        SCCB_Delay();
+        SCCB_SCL_L();
+        SCCB_Delay();
+    }
+
+    /* Release SIOD for the acknowledge bit. */
+    SCCB_SDA_H();
+    SCCB_Delay();
+    SCCB_SCL_H();
+    SCCB_Delay();
+    ack = (SCCB_SDA_Read() == GPIO_PIN_RESET) ? 1U : 0U;
+    SCCB_SCL_L();
+    SCCB_Delay();
+    return ack;
+}
+
+static uint8_t SCCB_ReadByte(void)
+{
+    uint8_t mask;
+    uint8_t value = 0U;
+
+    SCCB_SDA_H();
+    for (mask = 0x80U; mask != 0U; mask >>= 1U)
+    {
+        SCCB_SCL_H();
+        SCCB_Delay();
+        if (SCCB_SDA_Read() != GPIO_PIN_RESET)
+        {
+            value |= mask;
+        }
+        SCCB_SCL_L();
+        SCCB_Delay();
+    }
+    return value;
+}
+
+static void SCCB_SendNack(void)
+{
+    SCCB_SDA_H();
+    SCCB_Delay();
+    SCCB_SCL_H();
+    SCCB_Delay();
+    SCCB_SCL_L();
+    SCCB_Delay();
+}
+
+static HAL_StatusTypeDef OV7670_WriteRegisterOnce(uint8_t reg, uint8_t value)
+{
+    HAL_StatusTypeDef status = HAL_ERROR;
+
+    SCCB_Start();
+    if (SCCB_WriteByte(OV7670_SCCB_WRITE_ADDR) != 0U &&
+        SCCB_WriteByte(reg) != 0U &&
+        SCCB_WriteByte(value) != 0U)
+    {
+        status = HAL_OK;
+    }
+    SCCB_Stop();
+    return status;
+}
+
+HAL_StatusTypeDef OV7670_WriteRegister(uint8_t reg, uint8_t value)
+{
+    uint8_t retry;
+
+    for (retry = 0U; retry < 3U; retry++)
+    {
+        if (OV7670_WriteRegisterOnce(reg, value) == HAL_OK)
+        {
+            return HAL_OK;
+        }
+        delay_us(OV7670_CONFIG_DELAY_US);
+    }
+    return HAL_ERROR;
+}
+
+HAL_StatusTypeDef OV7670_ReadRegister(uint8_t reg, uint8_t *value)
+{
+    uint8_t retry;
+
+    if (value == NULL)
+    {
+        return HAL_ERROR;
+    }
+
+    for (retry = 0U; retry < 3U; retry++)
+    {
+        SCCB_Start();
+        if (SCCB_WriteByte(OV7670_SCCB_WRITE_ADDR) == 0U ||
+            SCCB_WriteByte(reg) == 0U)
+        {
+            SCCB_Stop();
+            continue;
+        }
+
+        /* The module documentation uses a STOP between the register-address
+         * phase and the read phase.  Keep this sequence instead of relying on
+         * an I2C-style repeated START, which some OV7670 modules reject. */
+        SCCB_Stop();
+        delay_us(OV7670_CONFIG_DELAY_US);
+
+        SCCB_Start();
+        if (SCCB_WriteByte(OV7670_SCCB_READ_ADDR) == 0U)
+        {
+            SCCB_Stop();
+            continue;
+        }
+
+        *value = SCCB_ReadByte();
+        SCCB_SendNack();
+        SCCB_Stop();
+        return HAL_OK;
+    }
+
+    return HAL_ERROR;
+}
+
+static void OV7670_Control_GPIO_Init(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+
+    gpio.Pin = OV7670_RESET_PIN | OV7670_PWDN_PIN;
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+    gpio.Alternate = 0U;
+    HAL_GPIO_Init(GPIOC, &gpio);
+
+    gpio.Pin = OV7670_SIOC_PIN | OV7670_SIOD_PIN;
+    gpio.Mode = GPIO_MODE_OUTPUT_OD;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+    gpio.Alternate = 0U;
+    HAL_GPIO_Init(GPIOB, &gpio);
+
+    HAL_GPIO_WritePin(OV7670_PWDN_PORT, OV7670_PWDN_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(OV7670_RESET_PORT, OV7670_RESET_PIN, GPIO_PIN_RESET);
+    SCCB_SDA_H();
+    SCCB_SCL_H();
+}
+
+static void OV7670_XCLK_Init(void)
+{
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    /* The supplied module reference uses HSE as the camera clock. With the
+     * normal F407 8 MHz HSE this keeps XCLK within the OV7670 input range. */
+    HAL_RCC_MCOConfig(RCC_MCO1, RCC_MCO1SOURCE_HSE, RCC_MCODIV_1);
+}
+
+void HAL_DCMI_MspInit(DCMI_HandleTypeDef *dcmi_handle)
+{
+    GPIO_InitTypeDef gpio = {0};
+
+    if ((dcmi_handle == NULL) || (dcmi_handle->Instance != DCMI))
+    {
+        return;
+    }
+
+    __HAL_RCC_DCMI_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOE_CLK_ENABLE();
+    __HAL_RCC_DMA2_CLK_ENABLE();
+
+    gpio.Mode = GPIO_MODE_AF_PP;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    gpio.Alternate = GPIO_AF13_DCMI;
+
+    gpio.Pin = GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_8 | GPIO_PIN_9;
+    HAL_GPIO_Init(GPIOC, &gpio);
+
+    gpio.Pin = GPIO_PIN_4;
+    HAL_GPIO_Init(GPIOE, &gpio);
+
+    gpio.Pin = GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_8 | GPIO_PIN_9;
+    HAL_GPIO_Init(GPIOB, &gpio);
+
+    gpio.Pin = GPIO_PIN_4 | GPIO_PIN_6;
+    HAL_GPIO_Init(GPIOA, &gpio);
+
+    if (s_dcmi_msp_initialized == 0U)
+    {
+        hdma_dcmi.Instance                 = DMA2_Stream1;
+        hdma_dcmi.Init.Channel              = DMA_CHANNEL_1;
+        hdma_dcmi.Init.Direction            = DMA_PERIPH_TO_MEMORY;
+        hdma_dcmi.Init.PeriphInc            = DMA_PINC_DISABLE;
+        hdma_dcmi.Init.MemInc               = DMA_MINC_ENABLE;
+        hdma_dcmi.Init.PeriphDataAlignment  = DMA_PDATAALIGN_WORD;
+        hdma_dcmi.Init.MemDataAlignment     = DMA_MDATAALIGN_WORD;
+        hdma_dcmi.Init.Mode                 = DMA_NORMAL;
+        hdma_dcmi.Init.Priority             = DMA_PRIORITY_HIGH;
+        hdma_dcmi.Init.FIFOMode             = DMA_FIFOMODE_DISABLE;
+        hdma_dcmi.Init.FIFOThreshold        = DMA_FIFO_THRESHOLD_FULL;
+        hdma_dcmi.Init.MemBurst             = DMA_MBURST_SINGLE;
+        hdma_dcmi.Init.PeriphBurst          = DMA_PBURST_SINGLE;
+
+        if (HAL_DMA_Init(&hdma_dcmi) != HAL_OK)
+        {
+            return;
+        }
+        s_dcmi_msp_initialized = 1U;
+        HAL_NVIC_SetPriority(DMA2_Stream1_IRQn, 5U, 0U);
+        HAL_NVIC_EnableIRQ(DMA2_Stream1_IRQn);
+        HAL_NVIC_SetPriority(DCMI_IRQn, 5U, 1U);
+        HAL_NVIC_EnableIRQ(DCMI_IRQn);
+    }
+
+    __HAL_LINKDMA(dcmi_handle, DMA_Handle, hdma_dcmi);
+}
+
+void HAL_DCMI_MspDeInit(DCMI_HandleTypeDef *dcmi_handle)
+{
+    if ((dcmi_handle == NULL) || (dcmi_handle->Instance != DCMI))
+    {
+        return;
+    }
+
+    HAL_GPIO_DeInit(GPIOA, GPIO_PIN_4 | GPIO_PIN_6);
+    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_8 | GPIO_PIN_9);
+    HAL_GPIO_DeInit(GPIOC, GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_8 | GPIO_PIN_9);
+    HAL_GPIO_DeInit(GPIOE, GPIO_PIN_4);
+    HAL_DMA_DeInit(dcmi_handle->DMA_Handle);
+    HAL_NVIC_DisableIRQ(DMA2_Stream1_IRQn);
+    HAL_NVIC_DisableIRQ(DCMI_IRQn);
+    s_dcmi_msp_initialized = 0U;
+}
+
+static HAL_StatusTypeDef OV7670_DCMI_Init(void)
+{
+    (void)memset(&hdcmi, 0, sizeof(hdcmi));
+    hdcmi.Instance = DCMI;
+    hdcmi.Init.SynchroMode = DCMI_SYNCHRO_HARDWARE;
+    hdcmi.Init.PCKPolarity = DCMI_PCKPOLARITY_FALLING;
+    hdcmi.Init.VSPolarity = DCMI_VSPOLARITY_HIGH;
+    hdcmi.Init.HSPolarity = DCMI_HSPOLARITY_LOW;
+    hdcmi.Init.CaptureRate = DCMI_CR_ALL_FRAME;
+    hdcmi.Init.ExtendedDataMode = DCMI_EXTEND_DATA_8B;
+    hdcmi.Init.JPEGMode = DCMI_JPEG_DISABLE;
+    if (HAL_DCMI_Init(&hdcmi) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    /* The sensor outputs 640x120 RGB565 (153600 bytes/frame), which does not
+     * fit into SRAM. Crop a 320x120 window = 640 pixel clocks per line x 120
+     * lines -> 76800 bytes/frame, so the DMA never overruns. */
+    if (HAL_DCMI_ConfigCrop(&hdcmi, 0U, 0U, 640U, 120U) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+    if (HAL_DCMI_EnableCrop(&hdcmi) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    return HAL_OK;
+}
+static OV7670_StatusTypeDef OV7670_ApplyConfiguration(void)
+{
+    uint32_t i;
+
+    for (i = 0U; i < (sizeof(s_vendor_qvga_config) / sizeof(s_vendor_qvga_config[0])); i++)
+    {
+        if (OV7670_WriteRegister(s_vendor_qvga_config[i].reg,
+                                 s_vendor_qvga_config[i].value) != HAL_OK)
+        {
+            return OV7670_STATUS_CONFIG_ERROR;
+        }
+        delay_us(OV7670_CONFIG_DELAY_US);
+    }
+
+    /* SHARP VARIANT: QQVGA downsample disabled -> QVGA 320x240 output. */
+
+    return OV7670_STATUS_OK;
+}
+
+OV7670_StatusTypeDef OV7670_Init(void)
+{
+    uint8_t pid;
+    uint8_t version;
+
+    s_initialized = 0U;
+    s_frame_ready = 0U;
+
+    s_last_error = HAL_DCMI_ERROR_NONE;
+
+    hdcmi.ErrorCode = HAL_DCMI_ERROR_NONE;
+
+    hdcmi.State = HAL_DCMI_STATE_READY;
+
+    OV7670_Control_GPIO_Init();
+    OV7670_XCLK_Init();
+    delay_ms(20U);
+    HAL_GPIO_WritePin(OV7670_RESET_PORT, OV7670_RESET_PIN, GPIO_PIN_SET);
+    delay_ms(20U);
+
+    if (OV7670_ReadRegister(OV7670_PID_REG, &pid) != HAL_OK ||
+        OV7670_ReadRegister(OV7670_VER_REG, &version) != HAL_OK)
+    {
+        return OV7670_STATUS_ERROR;
+    }
+    if ((pid != OV7670_ID_PID) || (version != OV7670_ID_VER))
+    {
+        return OV7670_STATUS_ID_ERROR;
+    }
+
+    if (OV7670_WriteRegister(0x12U, 0x80U) != HAL_OK)
+    {
+        return OV7670_STATUS_CONFIG_ERROR;
+    }
+    delay_ms(100U);
+
+    if (OV7670_ApplyConfiguration() != OV7670_STATUS_OK)
+    {
+        return OV7670_STATUS_CONFIG_ERROR;
+    }
+
+    if (OV7670_DCMI_Init() != HAL_OK)
+    {
+        return OV7670_STATUS_CONFIG_ERROR;
+    }
+
+    s_initialized = 1U;
+    return OV7670_STATUS_OK;
+}
+
+HAL_StatusTypeDef OV7670_Start(void)
+{
+    if (s_initialized == 0U)
+    {
+        return HAL_ERROR;
+    }
+
+    s_frame_ready = 0U;
+
+    s_last_error = HAL_DCMI_ERROR_NONE;
+
+    hdcmi.ErrorCode = HAL_DCMI_ERROR_NONE;
+
+    hdcmi.State = HAL_DCMI_STATE_READY;
+    __HAL_DCMI_CLEAR_FLAG(&hdcmi, DCMI_FLAG_FRAMERI | DCMI_FLAG_OVRRI |
+                          DCMI_FLAG_ERRRI | DCMI_FLAG_VSYNCRI | DCMI_FLAG_LINERI);
+
+    return HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT,
+                              (uint32_t)s_frame_buffer, OV7670_FRAME_WORDS);
+}
+
+HAL_StatusTypeDef OV7670_Stop(void)
+{
+    if (s_initialized == 0U)
+    {
+        return HAL_ERROR;
+    }
+    return HAL_DCMI_Stop(&hdcmi);
+}
+
+uint8_t OV7670_IsFrameReady(void)
+{
+    if (s_frame_ready != 0U)
+    {
+        return 1U;
+    }
+    if (s_initialized == 0U)
+    {
+        return 0U;
+    }
+    /* Snapshot mode: the hardware clears CAPTURE after one complete frame.
+     * The module outputs ~121 HREF lines, so a trailing DCMI overrun fires
+     * right AFTER the 38400-byte crop has been fully transferred (NDTR==0).
+     * In that case the buffer already holds a complete 160x120 image, so an
+     * overrun with NDTR==0 is treated as "frame ready". Only an overrun with
+     * NDTR>0 (DMA could not keep up) is a real problem. */
+    if (((DCMI->CR & DCMI_CR_CAPTURE) == 0U) &&
+        (DMA2_Stream1->NDTR == 0U))
+    {
+        s_frame_ready = 1U;
+        return 1U;
+    }
+    return 0U;
+}
+
+void OV7670_ClearFrameReady(void)
+{
+    s_frame_ready = 0U;
+}
+
+uint32_t OV7670_GetLastError(void)
+{
+    return s_last_error;
+}
+
+const uint8_t *OV7670_GetFrameBuffer(void)
+{
+    return (const uint8_t *)s_frame_buffer;
+}
+
+uint32_t OV7670_GetFrameSize(void)
+{
+    return OV7670_FRAME_BYTES;
+}
+
+uint16_t OV7670_GetPixel(uint16_t x, uint16_t y)
+{
+    const uint8_t *pixel;
+
+    if ((x >= OV7670_FRAME_WIDTH) || (y >= OV7670_FRAME_HEIGHT))
+    {
+        return 0U;
+    }
+
+    pixel = ((const uint8_t *)s_frame_buffer) +
+            (((uint32_t)y * OV7670_FRAME_WIDTH + x) * 2U);
+    /* The vendor table selects high-byte-first RGB565 output. */
+    return (uint16_t)(((uint16_t)pixel[0] << 8) | pixel[1]);
+}
+
+void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *dcmi_handle)
+{
+    if (dcmi_handle == &hdcmi)
+    {
+        s_frame_ready = 1U;
+    }
+}
+
+void HAL_DCMI_ErrorCallback(DCMI_HandleTypeDef *dcmi_handle)
+{
+    if (dcmi_handle == &hdcmi)
+    {
+        s_last_error = dcmi_handle->ErrorCode;
+        s_frame_ready = 0U;
+    }
+}
